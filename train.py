@@ -224,7 +224,7 @@ def parse_args(argv):
         "-d", "--dataset", type=str, required=True, help="Training dataset"
     )
     parser.add_argument(
-        "-t", "--test_dataset", default="../Kodak24", type=str, help="Test dataset while training"
+        "-t", "--test_dataset", default="./Kodak24", type=str, help="Test dataset while training"
     )
     parser.add_argument(
         "-e",

@@ -116,6 +116,7 @@ def eval_lpips(origin_path, gene_path):
     del loss_fn
     return total_lpips_distance / i
 
+
 @torch.no_grad()
 def inference(model, x, recon_dir, name=None):
     x = x.unsqueeze(0)
@@ -224,7 +225,6 @@ def eval_model(model, filepaths, recon_dir, entropy_estimation=False, half=False
     device = next(model.parameters()).device
     metrics = defaultdict(float)
     for f in filepaths:
-        # print(f)
         x = read_image(f).to(device)
         if not entropy_estimation:
             if half:
@@ -233,7 +233,6 @@ def eval_model(model, filepaths, recon_dir, entropy_estimation=False, half=False
             rv = inference(model, x, recon_dir, f)
         else:
             rv = inference_entropy_estimation(model, x)
-        # print(rv)
         for k, v in rv.items():
             metrics[k] += v
     for k, v in metrics.items():

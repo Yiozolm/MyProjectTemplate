@@ -14,11 +14,14 @@ import torch.optim as optim
 import torch.utils.data as DataLoader
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
-
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image.dists import DeepImageStructureAndTextureSimilarity
+from tqdm import tqdm
 from compressai.datasets import ImageFolder
-
+from PIL import Image
 from modelpreparation import models
-from test import collect_images, eval_model, eval_fid, eval_dist, eval_lpips
+from test import collect_images, eval_model
 
 torch.backends.cudnn.enabled = False
 
@@ -174,34 +177,70 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
     return loss, img_bpp, mse_loss, psnr, aux_loss
 
 
+def load_images(folder, transform, max_images=None):
+    images = []
+    filenames = sorted(os.listdir(folder))
+    if max_images:
+        filenames = filenames[:max_images]
+    for fname in tqdm(filenames, desc=f"Loading {folder}"):
+        if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img = Image.open(os.path.join(folder, fname)).convert('RGB')
+            images.append(transform(img))
+    return torch.stack(images), filenames
+
+
+def generativeMetric(test_path, recon_dir):
+    device = torch.device('cuda')
+    # transforms
+    transform_fid = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor()
+    ])
+
+    transform_metric = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
+
+    # 加载图像
+    real_fid, _ = load_images(test_path, transform_fid)
+    fake_fid, _ = load_images(recon_dir, transform_fid)
+
+    real_metric, _ = load_images(test_path, transform_metric)
+    fake_metric, _ = load_images(recon_dir, transform_metric)
+
+    # FID
+    fid = FrechetInceptionDistance(normalize=True).to(device)
+    fid.update(real_fid.to(device), real=True)
+    fid.update(fake_fid.to(device), real=False)
+    fid_score = fid.compute().item()
+
+    # LPIPS（支持 alex / vgg / squeeze）
+    lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
+    lpips_scores = lpips(real_metric.to(device), fake_metric.to(device))
+
+    # DISTS
+    dists = DeepImageStructureAndTextureSimilarity().to(device)
+    dists_scores = dists(fake_metric.to(device), real_metric.to(device))
+
+    return {"fid":fid_score, "lpips":lpips_scores, "dists":dists_scores}
+
+
 def test_epoch(model, test_path, recon_dir):
     if not os.path.exists(recon_dir):
         os.makedirs(recon_dir)
     filepaths = collect_images(test_path)
     model.update(force=True)
     metrics = eval_model(model, filepaths, recon_dir, entropy_estimation=False)
-    try:
-        FIDvalue = eval_fid(test_path, recon_dir)
-    except:
-        FIDvalue = 0
-
-    try:
-        LPIPSvalue = eval_lpips(test_path, recon_dir)
-    except:
-        LPIPSvalue = 0
-
-    try:
-        DISTSvalue = eval_dist(test_path, recon_dir)
-    except:
-        DISTSvalue = 0
+    generative = generativeMetric(test_path, recon_dir)
 
     return {
         'bpp': metrics['bpp'],
         'PSNR': metrics['psnr'],
         'MS-SSIM': metrics['ms-ssim'],
-        'FID': FIDvalue,
-        'LPIPS': LPIPSvalue,
-        'DISTS': DISTSvalue,
+        'FID': generative['fid'],
+        'LPIPS': generative['lpips'],
+        'DISTS': generative['dists'],
     }
 
 

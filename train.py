@@ -335,6 +335,7 @@ def parse_args(argv):
     parser.add_argument("--log_dir", default="./logs_ll", type=str, help="Path to save log")
     parser.add_argument("--recon_dir", default="./test", type=str, help="Test reconstruction image path"
                         )
+    parser.set_defaults(cuda=True)
     args = parser.parse_args(argv)
     return args
 
@@ -345,6 +346,9 @@ def main(argv):
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
+
+    if args.save_path and not os.path.exists(args.save_path):
+        os.makedirs(args.save_path)
 
     train_transforms = transforms.Compose(
         [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
@@ -382,7 +386,7 @@ def main(argv):
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.3)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
-    tb_writer = SummaryWriter(argv.log_dir)
+    tb_writer = SummaryWriter(args.log_dir)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
@@ -424,11 +428,11 @@ def main(argv):
                     "lr_scheduler": lr_scheduler.state_dict(),
                 },
                 is_best,
-                os.path.join(args.save_path, "ckp" + str(argv.lmbda * 1000) + '.tar'),
+                os.path.join(args.save_path, "ckp" + str(args.lmbda * 1000) + '.tar'),
             )
 
-        if argv.test_dataset:
-            test_epoch(net, argv.test_dataset, os.path.join(argv.recon_dir, args.model + "-" + str(argv.lmbda * 1000)))
+        if args.test_dataset:
+            test_epoch(net, args.test_dataset, os.path.join(args.recon_dir, args.model + "-" + str(args.lmbda * 1000)))
 
     tb_writer.close()
 

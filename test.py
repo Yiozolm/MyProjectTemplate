@@ -13,6 +13,9 @@ import lpips
 from DISTS_pytorch import DISTS
 from pytorch_fid import fid_score
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
 

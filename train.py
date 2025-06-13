@@ -1,29 +1,25 @@
 import argparse
-import numpy as np
-import shutil
-import random
 import math
-import sys
+import numpy as np
 import os
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
+import shutil
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as DataLoader
-from torchvision import transforms
-from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from torchmetrics.image.dists import DeepImageStructureAndTextureSimilarity
-from tqdm import tqdm
-from compressai.datasets import ImageFolder
+import warnings
 from PIL import Image
-from modelpreparation import models
-from test import collect_images, eval_model
+from compressai.models import MeanScaleHyperprior
+from models import models
+# 导入 AMP 工具
+from torch.amp import GradScaler, autocast
+from torch.utils import data
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
 
-torch.backends.cudnn.enabled = False
+warnings.filterwarnings("ignore")
+
+torch.backends.cudnn.enabled = True  # 开启 cuDNN 以获得更好性能
 
 
 def configure_optimizers(model, args):
@@ -80,10 +76,11 @@ class RateDistortionLoss(nn.Module):
         return out
 
 
-def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, train_step, tb_writer=None,
-                    clip_max_norm=None):
+def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, train_step,
+                    scaler, amp_dtype, tb_writer=None, clip_max_norm=None):
     model.train()
     device = next(model.parameters()).device
+    amp_enabled = amp_dtype is not None
 
     train_size = 0
     for x in train_dataloader:
@@ -92,24 +89,41 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out = model(x)
+        # 使用 autocast 上下文管理器进行前向传播
+        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+            out = model(x)
+            out_criterion = criterion(out, x)
 
-        out_criterion = criterion(out, x)
-        out_criterion["loss"].backward()
+        # 使用 GradScaler 缩放损失并进行反向传播
+        scaler.scale(out_criterion["loss"]).backward()
+
+        # 在 optimizer.step() 之前 unscale 梯度以便裁剪
         if clip_max_norm:
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
-        optimizer.step()
 
-        aux_loss = model.aux_loss()
-        aux_loss.backward()
-        aux_optimizer.step()
+        # scaler.step() 会自动 unscale 梯度并执行优化
+        scaler.step(optimizer)
+
+        # 对 auxiliary loss 执行相同的操作
+        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+            if torch.cuda.device_count() > 1:
+                aux_loss = model.module.aux_loss()
+            else:
+                aux_loss = model.aux_loss()
+
+        scaler.scale(aux_loss).backward()
+        scaler.step(aux_optimizer)
+
+        # 在所有 optimizer.step() 后更新 scaler
+        scaler.update()
 
         train_step += 1
         if tb_writer and train_step % 10 == 1:
             tb_writer.add_scalar('train loss', out_criterion["loss"].item(), train_step)
             tb_writer.add_scalar('train mse', out_criterion["mse_loss"].item(), train_step)
-            tb_writer.add_scalar('train img bpp', out_criterion["img_bpp"].item(), train_step)
-            tb_writer.add_scalar('train aux', model.aux_loss().item(), train_step)
+            tb_writer.add_scalar('train img bpp', out_criterion["bpp_loss"].item(), train_step)
+            tb_writer.add_scalar('train aux', aux_loss.item(), train_step)  # 使用上面计算过的aux_loss
 
         train_size += x.shape[0]
 
@@ -117,14 +131,15 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
     return train_step
 
 
-def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
+def eval_epoch(model, criterion, eval_dataloader, epoch, amp_dtype, tb_writer=None):
     model.eval()
     device = next(model.parameters()).device
+    amp_enabled = amp_dtype is not None
 
     loss = 0
     img_bpp = 0
     mse_loss = 0
-    aux_loss = []
+    aux_loss_val = 0
 
     if tb_writer:
         save_imgs = True
@@ -133,36 +148,43 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
 
     eval_size = 0
     with torch.no_grad():
-        for x in eval_dataloader:
-            x = x.to(device).contiguous()
+        # 评估时只需要 autocast
+        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+            for x in eval_dataloader:
+                x = x.to(device).contiguous()
 
-            out = model(x)
-            out_criterion = criterion(out, x)
+                out = model(x)
+                out_criterion = criterion(out, x)
 
-            N, _, H, W = x.shape
+                N, _, H, W = x.shape
 
-            loss += out_criterion["loss"] * N
-            img_bpp += out_criterion["img_bpp"] * N
-            mse_loss += out_criterion["mse_loss"] * N
-            aux_loss.append(model.aux_loss())
+                loss += out_criterion["loss"] * N
+                img_bpp += out_criterion["bpp_loss"] * N
+                mse_loss += out_criterion["mse_loss"] * N
+                if torch.cuda.device_count() > 1:
+                    aux_loss_val += model.module.aux_loss() * N
+                else:
+                    aux_loss_val += model.aux_loss() * N
 
-            if save_imgs:
-                x_rec = out["x_hat"].clamp_(0, 255)
-                tb_writer.add_image('input/0', x[0, :, :, :].to(torch.uint8), epoch)
-                tb_writer.add_image('input/1', x[1, :, :, :].to(torch.uint8), epoch)
-                tb_writer.add_image('input/2', x[2, :, :, :].to(torch.uint8), epoch)
-                tb_writer.add_image('output/0', x_rec[0, :, :, :].to(torch.uint8), epoch)
-                tb_writer.add_image('output/1', x_rec[1, :, :, :].to(torch.uint8), epoch)
-                tb_writer.add_image('output/2', x_rec[2, :, :, :].to(torch.uint8), epoch)
-                save_imgs = False
+                if save_imgs:
+                    # 将图像转回FP32以便于保存和显示
+                    x_rec = out["x_hat"].float().clamp_(0, 255)
+                    x = x.float()
+                    tb_writer.add_image('input/0', x[0, :, :, :].to(torch.uint8), epoch)
+                    tb_writer.add_image('input/1', x[1, :, :, :].to(torch.uint8), epoch)
+                    tb_writer.add_image('input/2', x[2, :, :, :].to(torch.uint8), epoch)
+                    tb_writer.add_image('output/0', x_rec[0, :, :, :].to(torch.uint8), epoch)
+                    tb_writer.add_image('output/1', x_rec[1, :, :, :].to(torch.uint8), epoch)
+                    tb_writer.add_image('output/2', x_rec[2, :, :, :].to(torch.uint8), epoch)
+                    save_imgs = False
 
-            eval_size += x.shape[0]
+                eval_size += x.shape[0]
 
         loss = (loss / eval_size).item()
         img_bpp = (img_bpp / eval_size).item()
         mse_loss = (mse_loss / eval_size).item()
-        aux_loss = (sum(aux_loss) / len(aux_loss)).item()
-        psnr = 10. * np.log10(255. ** 2 / mse_loss)
+        aux_loss = (aux_loss_val / eval_size).item()
+        psnr = 10. * np.log10(1. ** 2 / mse_loss)
         if tb_writer:
             tb_writer.add_scalar('eval/eval loss', loss, epoch)
             tb_writer.add_scalar('eval/eval img bpp', img_bpp, epoch)
@@ -177,73 +199,6 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
     return loss, img_bpp, mse_loss, psnr, aux_loss
 
 
-def load_images(folder, transform, max_images=None):
-    images = []
-    filenames = sorted(os.listdir(folder))
-    if max_images:
-        filenames = filenames[:max_images]
-    for fname in tqdm(filenames, desc=f"Loading {folder}"):
-        if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-            img = Image.open(os.path.join(folder, fname)).convert('RGB')
-            images.append(transform(img))
-    return torch.stack(images), filenames
-
-
-def generativeMetric(test_path, recon_dir):
-    device = torch.device('cuda')
-    # transforms
-    transform_fid = transforms.Compose([
-        transforms.Resize((299, 299)),
-        transforms.ToTensor()
-    ])
-
-    transform_metric = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor()
-    ])
-
-    # 加载图像
-    real_fid, _ = load_images(test_path, transform_fid)
-    fake_fid, _ = load_images(recon_dir, transform_fid)
-
-    real_metric, _ = load_images(test_path, transform_metric)
-    fake_metric, _ = load_images(recon_dir, transform_metric)
-
-    # FID
-    fid = FrechetInceptionDistance(normalize=True).to(device)
-    fid.update(real_fid.to(device), real=True)
-    fid.update(fake_fid.to(device), real=False)
-    fid_score = fid.compute().item()
-
-    # LPIPS（支持 alex / vgg / squeeze）
-    lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
-    lpips_scores = lpips(real_metric.to(device), fake_metric.to(device))
-
-    # DISTS
-    dists = DeepImageStructureAndTextureSimilarity().to(device)
-    dists_scores = dists(fake_metric.to(device), real_metric.to(device))
-
-    return {"fid":fid_score, "lpips":lpips_scores, "dists":dists_scores}
-
-
-def test_epoch(model, test_path, recon_dir):
-    if not os.path.exists(recon_dir):
-        os.makedirs(recon_dir)
-    filepaths = collect_images(test_path)
-    model.update(force=True)
-    metrics = eval_model(model, filepaths, recon_dir, entropy_estimation=False)
-    generative = generativeMetric(test_path, recon_dir)
-
-    return {
-        'bpp': metrics['bpp'],
-        'PSNR': metrics['psnr'],
-        'MS-SSIM': metrics['ms-ssim'],
-        'FID': generative['fid'],
-        'LPIPS': generative['lpips'],
-        'DISTS': generative['dists'],
-    }
-
-
 def save_checkpoint(state, is_best, filename):
     torch.save(state, filename)
     if is_best:
@@ -252,19 +207,6 @@ def save_checkpoint(state, is_best, filename):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
-    parser.add_argument(
-        "-m",
-        "--model",
-        default="stf",
-        choices=models.keys(),
-        help="Model architecture (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-d", "--dataset", type=str, required=True, help="Training dataset"
-    )
-    parser.add_argument(
-        "-t", "--test_dataset", default="./Kodak24", type=str, help="Test dataset while training"
-    )
     parser.add_argument(
         "-e",
         "--epochs",
@@ -283,7 +225,7 @@ def parse_args(argv):
         "-n",
         "--num-workers",
         type=int,
-        default=30,
+        default=16,
         help="Dataloaders threads (default: %(default)s)",
     )
     parser.add_argument(
@@ -297,7 +239,7 @@ def parse_args(argv):
         "--batch-size", type=int, default=16, help="Batch size (default: %(default)s)"
     )
     parser.add_argument(
-        "--eval-batch-size",
+        "--eval_batch_size",
         type=int,
         default=64,
         help="Eval batch size (default: %(default)s)",
@@ -320,6 +262,12 @@ def parse_args(argv):
         "--save", action="store_true", default=True, help="Save model to disk"
     )
     parser.add_argument(
+        "--half", action="store_true", default=False, help="Use FP16 mixed precision training"
+    )
+    parser.add_argument(
+        "--bf16", action="store_true", default=False, help="Use BF16 mixed precision training"
+    )
+    parser.add_argument(
         "--save_path", type=str, default="./ckp_ll", help="Where to Save model"
     )
     parser.add_argument(
@@ -332,7 +280,7 @@ def parse_args(argv):
         help="gradient clipping max norm (default: %(default)s",
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--log_dir", default="./logs_ll", type=str, help="Path to save log")
+    parser.add_argument("--log_dir", default="./logs_ll/", type=str, help="Path to save log")
     parser.add_argument("--recon_dir", default="./test", type=str, help="Test reconstruction image path"
                         )
     parser.set_defaults(cuda=True)
@@ -340,12 +288,56 @@ def parse_args(argv):
     return args
 
 
+class ImageDataset(data.Dataset):
+
+    def __init__(self, path_dir, img_mode=None, transform=None):
+        self.path_dir = path_dir
+        self.img_mode = img_mode
+        self.transform = transform
+        self.images = os.listdir(self.path_dir)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        image_name = self.images[index]
+        img_path = os.path.join(self.path_dir, image_name)
+        img = Image.open(img_path)
+
+        if self.img_mode is not None:
+            img = img.convert(self.img_mode)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if img.shape[0] < 3:
+            img = img.expand(3, -1, -1)
+        elif img.shape[0] > 3:
+            img = img[:-1, :, :]
+
+        return img
+
+
 def main(argv):
     args = parse_args(argv)
     print(args)
+
+    # 确定混合精度模式
+    amp_dtype = None
+    if args.half and args.bf16:
+        raise ValueError("Cannot use --half (fp16) and --bf16 together.")
+    elif args.half:
+        amp_dtype = torch.float16
+        print("Using FP16 mixed precision training.")
+    elif args.bf16:
+        amp_dtype = torch.bfloat16
+        print("Using BF16 mixed precision training.")
+    else:
+        print("Using FP32 training.")
+
     if args.seed is not None:
         torch.manual_seed(args.seed)
-        random.seed(args.seed)
+        np.random.seed(args.seed)
 
     if args.save_path and not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
@@ -358,12 +350,11 @@ def main(argv):
         [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
     )
 
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    eval_dataset = ImageFolder(args.dataset, split="eval", transform=eval_transforms)
-
+    train_dataset = ImageDataset("your/train/data", transform=train_transforms)
+    eval_dataset = ImageDataset("your/test/data", transform=eval_transforms)
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    train_dataloader = DataLoader(
+    train_dataloader = data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -371,7 +362,7 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    eval_dataloader = DataLoader(
+    eval_dataloader = data.DataLoader(
         eval_dataset,
         batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
@@ -379,14 +370,24 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = models[args.model]()
+    net = MeanScaleHyperprior(N=128, M=192)
+
+    # Wrap the model with DataParallel
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training")
+        net = nn.DataParallel(net)
+
     net = net.to(device)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.3)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
+    # 初始化 GradScaler。仅在 fp16 (half) 模式下启用
+    scaler = GradScaler(enabled=args.half)
+
     tb_writer = SummaryWriter(args.log_dir)
+    train_step = 0
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
@@ -394,46 +395,58 @@ def main(argv):
         checkpoint = torch.load(args.checkpoint, map_location=device)
         last_epoch = checkpoint["epoch"] + 1
         net.load_state_dict(checkpoint["state_dict"])
-
         optimizer.load_state_dict(checkpoint["optimizer"])
         aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        train_step = checkpoint["step"]
+        if 'scaler' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler'])
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
         print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        train_one_epoch(
+        train_step = train_one_epoch(
             net,
             criterion,
             train_dataloader,
             optimizer,
             aux_optimizer,
-            epoch,
+            train_step,
+            scaler,
+            amp_dtype,
+            tb_writer,
             args.clip_max_norm,
         )
-        loss = test_epoch(epoch, eval_dataloader, net, criterion)
-        lr_scheduler.step(loss)
+
+        loss, img_bpp, mse_loss, psnr, aux_loss = eval_epoch(net, criterion, eval_dataloader, epoch, amp_dtype,
+                                                             tb_writer)
+
+        if torch.cuda.device_count() > 1:
+            lr_scheduler.module.step()
+        else:
+            lr_scheduler.step()
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
 
         if args.save:
+            # 将 scaler 的状态也保存到 checkpoint
+            checkpoint_dict = {
+                "epoch": epoch,
+                "state_dict": net.state_dict(),
+                "loss": loss,
+                "optimizer": optimizer.state_dict(),
+                "aux_optimizer": aux_optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+            }
             save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
+                checkpoint_dict,
                 is_best,
-                os.path.join(args.save_path, "ckp" + str(args.lmbda * 1000) + '.tar'),
+                os.path.join(args.save_path, "ckp" + str(int(args.lmbda * 10000)) + '.tar'),
             )
 
-        if args.test_dataset:
-            test_epoch(net, args.test_dataset, os.path.join(args.recon_dir, args.model + "-" + str(args.lmbda * 1000)))
-
+        print("---------------")
     tb_writer.close()
 
 

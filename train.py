@@ -9,17 +9,16 @@ import torch.nn as nn
 import torch.optim as optim
 import warnings
 from PIL import Image
-from compressai.models import MeanScaleHyperprior
+from torch.optim.optimizer import Args
 from models import models
-# 导入 AMP 工具
-from torch.amp import GradScaler, autocast
 from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
+from accelerate import Accelerator
 
 warnings.filterwarnings("ignore")
 
-torch.backends.cudnn.enabled = True  # 开启 cuDNN 以获得更好性能
+torch.backends.cudnn.enabled = True
 
 
 def configure_optimizers(model, args):
@@ -70,134 +69,111 @@ class RateDistortionLoss(nn.Module):
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"].values()
         )
-        out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+        out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
+        out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
 
         return out
 
 
 def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, train_step,
-                    scaler, amp_dtype, tb_writer=None, clip_max_norm=None):
+                    accelerator, tb_writer=None, clip_max_norm=None):
     model.train()
-    device = next(model.parameters()).device
-    amp_enabled = amp_dtype is not None
-
+    
     train_size = 0
     for x in train_dataloader:
-        x = x.to(device).contiguous()
-
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        # 使用 autocast 上下文管理器进行前向传播
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
-            out = model(x)
-            out_criterion = criterion(out, x)
+        out = model(x)
+        out_criterion = criterion(out, x)
 
-        # 使用 GradScaler 缩放损失并进行反向传播
-        scaler.scale(out_criterion["loss"]).backward()
+        accelerator.backward(out_criterion["loss"])
 
-        # 在 optimizer.step() 之前 unscale 梯度以便裁剪
         if clip_max_norm:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+            accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
+            
+        optimizer.step()
+        
+        aux_loss = model.aux_loss()
 
-        # scaler.step() 会自动 unscale 梯度并执行优化
-        scaler.step(optimizer)
-
-        # 对 auxiliary loss 执行相同的操作
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
-            if torch.cuda.device_count() > 1:
-                aux_loss = model.module.aux_loss()
-            else:
-                aux_loss = model.aux_loss()
-
-        scaler.scale(aux_loss).backward()
-        scaler.step(aux_optimizer)
-
-        # 在所有 optimizer.step() 后更新 scaler
-        scaler.update()
+        # 使用 accelerator.backward
+        accelerator.backward(aux_loss)
+        aux_optimizer.step()
 
         train_step += 1
-        if tb_writer and train_step % 10 == 1:
+        if accelerator.is_main_process and tb_writer and train_step % 10 == 1:
             tb_writer.add_scalar('train loss', out_criterion["loss"].item(), train_step)
             tb_writer.add_scalar('train mse', out_criterion["mse_loss"].item(), train_step)
             tb_writer.add_scalar('train img bpp', out_criterion["bpp_loss"].item(), train_step)
-            tb_writer.add_scalar('train aux', aux_loss.item(), train_step)  # 使用上面计算过的aux_loss
+            tb_writer.add_scalar('train aux', aux_loss.item(), train_step)
 
         train_size += x.shape[0]
 
-    print("train sz:{}".format(train_size))
+    if accelerator.is_main_process:
+        print("train sz:{}".format(train_size * accelerator.num_processes)) 
     return train_step
 
 
-def eval_epoch(model, criterion, eval_dataloader, epoch, amp_dtype, tb_writer=None):
+def eval_epoch(model, criterion, eval_dataloader, epoch, accelerator, tb_writer=None):
     model.eval()
-    device = next(model.parameters()).device
-    amp_enabled = amp_dtype is not None
 
     loss = 0
     img_bpp = 0
     mse_loss = 0
     aux_loss_val = 0
-
-    if tb_writer:
-        save_imgs = True
-    else:
-        save_imgs = False
-
     eval_size = 0
+    
+    save_imgs = tb_writer is not None
+
     with torch.no_grad():
-        # 评估时只需要 autocast
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
-            for x in eval_dataloader:
-                x = x.to(device).contiguous()
+        for x in eval_dataloader:
+            out = model(x)
+            out_criterion = criterion(out, x)
+            N = x.shape[0]
 
-                out = model(x)
-                out_criterion = criterion(out, x)
+            loss += out_criterion["loss"] * N
+            img_bpp += out_criterion["bpp_loss"] * N
+            mse_loss += out_criterion["mse_loss"] * N
+            aux_loss_val += model.aux_loss() * N
+            eval_size += N
+            
+            if accelerator.is_main_process and save_imgs:
+                x_rec = (out["x_hat"].float() * 255.).clamp_(0, 255)
+                x_orig = x.float() * 255.
+                tb_writer.add_image('input/0', x_orig[0, :, :, :].to(torch.uint8), epoch)
+                tb_writer.add_image('input/1', x_orig[1, :, :, :].to(torch.uint8), epoch)
+                tb_writer.add_image('input/2', x_orig[2, :, :, :].to(torch.uint8), epoch)
+                tb_writer.add_image('output/0', x_rec[0, :, :, :].to(torch.uint8), epoch)
+                tb_writer.add_image('output/1', x_rec[1, :, :, :].to(torch.uint8), epoch)
+                tb_writer.add_image('output/2', x_rec[2, :, :, :].to(torch.uint8), epoch)
+                save_imgs = False
+    
+    total_loss = accelerator.gather(loss.unsqueeze(0)).sum()
+    total_img_bpp = accelerator.gather(img_bpp.unsqueeze(0)).sum()
+    total_mse_loss = accelerator.gather(mse_loss.unsqueeze(0)).sum()
+    total_aux_loss_val = accelerator.gather(aux_loss_val.unsqueeze(0)).sum()
+    total_eval_size = accelerator.gather(torch.tensor([eval_size], device=accelerator.device)).sum()
 
-                N, _, H, W = x.shape
-
-                loss += out_criterion["loss"] * N
-                img_bpp += out_criterion["bpp_loss"] * N
-                mse_loss += out_criterion["mse_loss"] * N
-                if torch.cuda.device_count() > 1:
-                    aux_loss_val += model.module.aux_loss() * N
-                else:
-                    aux_loss_val += model.aux_loss() * N
-
-                if save_imgs:
-                    # 将图像转回FP32以便于保存和显示
-                    x_rec = out["x_hat"].float().clamp_(0, 255)
-                    x = x.float()
-                    tb_writer.add_image('input/0', x[0, :, :, :].to(torch.uint8), epoch)
-                    tb_writer.add_image('input/1', x[1, :, :, :].to(torch.uint8), epoch)
-                    tb_writer.add_image('input/2', x[2, :, :, :].to(torch.uint8), epoch)
-                    tb_writer.add_image('output/0', x_rec[0, :, :, :].to(torch.uint8), epoch)
-                    tb_writer.add_image('output/1', x_rec[1, :, :, :].to(torch.uint8), epoch)
-                    tb_writer.add_image('output/2', x_rec[2, :, :, :].to(torch.uint8), epoch)
-                    save_imgs = False
-
-                eval_size += x.shape[0]
-
-        loss = (loss / eval_size).item()
-        img_bpp = (img_bpp / eval_size).item()
-        mse_loss = (mse_loss / eval_size).item()
-        aux_loss = (aux_loss_val / eval_size).item()
-        psnr = 10. * np.log10(1. ** 2 / mse_loss)
+    if accelerator.is_main_process:
+        final_loss = (total_loss / total_eval_size).item()
+        final_img_bpp = (total_img_bpp / total_eval_size).item()
+        final_mse_loss = (total_mse_loss / total_eval_size).item()
+        final_aux_loss = (total_aux_loss_val / total_eval_size).item()
+        psnr = 10. * np.log10(1. ** 2 / final_mse_loss)
+        
         if tb_writer:
-            tb_writer.add_scalar('eval/eval loss', loss, epoch)
-            tb_writer.add_scalar('eval/eval img bpp', img_bpp, epoch)
-            tb_writer.add_scalar('eval/eval mse', mse_loss, epoch)
+            tb_writer.add_scalar('eval/eval loss', final_loss, epoch)
+            tb_writer.add_scalar('eval/eval img bpp', final_img_bpp, epoch)
+            tb_writer.add_scalar('eval/eval mse', final_mse_loss, epoch)
             tb_writer.add_scalar('eval/eval psnr', psnr, epoch)
-            tb_writer.add_scalar('eval/eval aux', aux_loss, epoch)
+            tb_writer.add_scalar('eval/eval aux', final_aux_loss, epoch)
+        
+        print("eval sz:{}".format(total_eval_size.item()))
+        print("Epoch(Eval):{}, img bpp:{}, mse:{}, psnr:{}".format(epoch, final_img_bpp, final_mse_loss, psnr))
+        
+        return final_loss, final_img_bpp, final_mse_loss, psnr, final_aux_loss
 
-        print("eval sz:{}".format(eval_size))
-
-    print("Epoch(Eval):{}, img bpp:{}, mse:{}, psnr:{}".format(epoch, img_bpp, mse_loss, psnr))
-
-    return loss, img_bpp, mse_loss, psnr, aux_loss
-
+    return None, None, None, None, None
 
 def save_checkpoint(state, is_best, filename):
     torch.save(state, filename)
@@ -210,7 +186,7 @@ def parse_args(argv):
     parser.add_argument(
         "-e",
         "--epochs",
-        default=100,
+        default=40,
         type=int,
         help="Number of epochs (default: %(default)s)",
     )
@@ -236,6 +212,13 @@ def parse_args(argv):
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=0.0067,
+        choices=['factorized', 'hyperprior', 'mbt2018-mean', 'mbt2018', 'cheng2020-anchor', 'cheng2020-attn],
+        help="Used Model (default: %(default)s)",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=16, help="Batch size (default: %(default)s)"
     )
     parser.add_argument(
@@ -257,7 +240,17 @@ def parse_args(argv):
         default=(256, 256),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
-    parser.add_argument("--cuda", action="store_true", help="Use cuda")
+    parser.add_argument(
+        "--N",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+        "--M",
+        type=int,
+        default=192,
+    )
+    parser.add_argument("--cuda", action="store_true", help="Use cuda (ignored when using accelerator)")
     parser.add_argument(
         "--save", action="store_true", default=True, help="Save model to disk"
     )
@@ -289,7 +282,6 @@ def parse_args(argv):
 
 
 class ImageDataset(data.Dataset):
-
     def __init__(self, path_dir, img_mode=None, transform=None):
         self.path_dir = path_dir
         self.img_mode = img_mode
@@ -300,21 +292,10 @@ class ImageDataset(data.Dataset):
         return len(self.images)
 
     def __getitem__(self, index):
-        image_name = self.images[index]
-        img_path = os.path.join(self.path_dir, image_name)
-        img = Image.open(img_path)
-
-        if self.img_mode is not None:
-            img = img.convert(self.img_mode)
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        if img.shape[0] < 3:
-            img = img.expand(3, -1, -1)
-        elif img.shape[0] > 3:
-            img = img[:-1, :, :]
-
+        img_path = os.path.join(self.path_dir, self.images[index])
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            return self.transform(img)
         return img
 
 
@@ -322,25 +303,24 @@ def main(argv):
     args = parse_args(argv)
     print(args)
 
-    # 确定混合精度模式
-    amp_dtype = None
+    mixed_precision = "no"
     if args.half and args.bf16:
         raise ValueError("Cannot use --half (fp16) and --bf16 together.")
     elif args.half:
-        amp_dtype = torch.float16
-        print("Using FP16 mixed precision training.")
+        mixed_precision = "fp16"
     elif args.bf16:
-        amp_dtype = torch.bfloat16
-        print("Using BF16 mixed precision training.")
-    else:
-        print("Using FP32 training.")
+        mixed_precision = "bf16"
+    
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    accelerator.print(f"Using {accelerator.num_processes} GPUs for training with {mixed_precision} precision.")
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
 
-    if args.save_path and not os.path.exists(args.save_path):
-        os.makedirs(args.save_path)
+    if accelerator.is_main_process:
+        if args.save_path and not os.path.exists(args.save_path):
+            os.makedirs(args.save_path)
 
     train_transforms = transforms.Compose(
         [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
@@ -352,14 +332,13 @@ def main(argv):
 
     train_dataset = ImageDataset("your/train/data", transform=train_transforms)
     eval_dataset = ImageDataset("your/test/data", transform=eval_transforms)
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     train_dataloader = data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
-        pin_memory=(device == "cuda"),
+        pin_memory=True,
     )
 
     eval_dataloader = data.DataLoader(
@@ -367,44 +346,39 @@ def main(argv):
         batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         shuffle=False,
-        pin_memory=(device == "cuda"),
+        pin_memory=True,
     )
 
-    net = MeanScaleHyperprior(N=128, M=192)
-
-    # Wrap the model with DataParallel
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for training")
-        net = nn.DataParallel(net)
-
-    net = net.to(device)
+    net = models[args.model](N=args.N, M=args.M)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.3)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[36], gamma=0.1)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
-
-    # 初始化 GradScaler。仅在 fp16 (half) 模式下启用
-    scaler = GradScaler(enabled=args.half)
-
-    tb_writer = SummaryWriter(args.log_dir)
+    
+    tb_writer = SummaryWriter(args.log_dir) if accelerator.is_main_process else None
     train_step = 0
 
+    net, optimizer, aux_optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        net, optimizer, aux_optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    )
+
     last_epoch = 0
-    if args.checkpoint:  # load from previous checkpoint
-        print("Loading", args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+    if args.checkpoint:
+        accelerator.print("Loading", args.checkpoint)
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
         last_epoch = checkpoint["epoch"] + 1
-        net.load_state_dict(checkpoint["state_dict"])
+        unwrapped_net = accelerator.unwrap_model(net)
+        unwrapped_net.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         train_step = checkpoint["step"]
-        if 'scaler' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler'])
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        if accelerator.is_main_process:
+            print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        
         train_step = train_one_epoch(
             net,
             criterion,
@@ -412,42 +386,39 @@ def main(argv):
             optimizer,
             aux_optimizer,
             train_step,
-            scaler,
-            amp_dtype,
+            accelerator,
             tb_writer,
             args.clip_max_norm,
         )
 
-        loss, img_bpp, mse_loss, psnr, aux_loss = eval_epoch(net, criterion, eval_dataloader, epoch, amp_dtype,
-                                                             tb_writer)
+        loss, *_ = eval_epoch(net, criterion, eval_dataloader, epoch, accelerator, tb_writer)
 
-        if torch.cuda.device_count() > 1:
-            lr_scheduler.module.step()
-        else:
-            lr_scheduler.step()
+        lr_scheduler.step()
 
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
+        if accelerator.is_main_process:
+            is_best = loss < best_loss
+            best_loss = min(loss, best_loss)
 
-        if args.save:
-            # 将 scaler 的状态也保存到 checkpoint
-            checkpoint_dict = {
-                "epoch": epoch,
-                "state_dict": net.state_dict(),
-                "loss": loss,
-                "optimizer": optimizer.state_dict(),
-                "aux_optimizer": aux_optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-            }
-            save_checkpoint(
-                checkpoint_dict,
-                is_best,
-                os.path.join(args.save_path, "ckp" + str(int(args.lmbda * 10000)) + '.tar'),
-            )
-
-        print("---------------")
-    tb_writer.close()
+            if args.save:
+                unwrapped_net = accelerator.unwrap_model(net)
+                checkpoint_dict = {
+                    "epoch": epoch,
+                    "state_dict": unwrapped_net.state_dict(),
+                    "loss": loss,
+                    "optimizer": optimizer.state_dict(),
+                    "aux_optimizer": aux_optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "step": train_step
+                }
+                save_checkpoint(
+                    checkpoint_dict,
+                    is_best,
+                    os.path.join(args.save_path, f"ckp{int(args.lmbda * 10000)}.tar"),
+                )
+            print("---------------")
+            
+    if tb_writer:
+        tb_writer.close()
 
 
 if __name__ == "__main__":

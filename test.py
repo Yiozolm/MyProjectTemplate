@@ -9,9 +9,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from pytorch_msssim import ms_ssim
-import lpips
-from DISTS_pytorch import DISTS
-from pytorch_fid import fid_score
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image.dists import DeepImageStructureAndTextureSimilarity
+from transformers import CLIPProcessor, CLIPModel
+
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -81,43 +83,77 @@ def eval_dist(origin_path, gene_path):
         distSum += dists_value.item()
     del D
 
-    return distSum / len(files)
-
+    return distSum/len(files)
 
 def eval_fid(origin_path, gene_path):
-    fid_value = fid_score.calculate_fid_given_paths([origin_path, gene_path],
-                                                    batch_size=24, device='cuda:0', dims=2048)
-    return fid_value
+    transform_fid = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor()
+    ])
+    real_fid, _ = load_images(origin_path, transform_fid)
+    fake_fid, _ = load_images(gene_path, transform_fid)
 
+    # FID
+    fid = FrechetInceptionDistance(normalize=True).to(device)
+    fid.update(real_fid.to(device), real=True)
+    fid.update(fake_fid.to(device), real=False)
+    fid_score = fid.compute().item()
+
+    return fid_score
 
 def eval_lpips(origin_path, gene_path):
-    loss_fn = lpips.LPIPS(net='alex', version='0.1')
-    loss_fn.cuda()
-    files = os.listdir(origin_path)
-    i = 0
-    total_lpips_distance = 0
+    transform_metric = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
 
-    for file in files:
+    real_metric, _ = load_images(origin_path, transform_metric)
+    fake_metric, _ = load_images(gene_path, transform_metric)
+
+    lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
+    lpips_scores = lpips(real_metric.to(device), fake_metric.to(device)).item()
+
+    return lpips_scores
+
+def calculate_clip_similarity_batch(origin_path: str, gene_path: str, model: CLIPModel, processor: CLIPProcessor, device: str) -> dict:
+    if not os.path.exists(origin_path) or not os.path.exists(gene_path):
+        raise FileNotFoundError(f"Error: Directory '{origin_path}' or '{gene_path}' does not exist.")
+
+    original_files = sorted(os.listdir(origin_path))
+    
+    similarity_scores = {}
+
+    for filename in original_files:
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            continue
+
+        original_path = os.path.join(origin_path, filename)
+        reconstructed_path = os.path.join(gene_path, filename)
+
+        if not os.path.exists(reconstructed_path):
+            print(f"Warning: Corresponding reconstructed image '{reconstructed_path}' not found, skipping.")
+            continue
 
         try:
-            # Load images
-            img0 = lpips.im2tensor(lpips.load_image(os.path.join(origin_path, file))).cuda()
-            img1 = lpips.im2tensor(lpips.load_image(os.path.join(gene_path, file))).cuda()
+            original_image = Image.open(original_path)
+            reconstructed_image = Image.open(reconstructed_path)
 
-            if os.path.exists(os.path.join(origin_path, file)) and os.path.exists(os.path.join(gene_path, file)):
-                i = i + 1
+            with torch.no_grad():
+                original_features = model.get_image_features(**processor(images=original_image, return_tensors="pt").to(device))
+                reconstructed_features = model.get_image_features(**processor(images=reconstructed_image, return_tensors="pt").to(device))
 
-            # Compute distance
-            current_lpips_distance = loss_fn.forward(img0, img1)
-            total_lpips_distance = total_lpips_distance + current_lpips_distance.item()
-
-            # print('%s: %.3f'%(file, current_lpips_distance))
+            original_features_norm = original_features / original_features.norm(p=2, dim=-1, keepdim=True)
+            reconstructed_features_norm = reconstructed_features / reconstructed_features.norm(p=2, dim=-1, keepdim=True)
+            similarity_score = (original_features_norm * reconstructed_features_norm).sum(dim=-1).item()
+            
+            similarity_scores[filename] = similarity_score
+            print(f"CLIP similarity for image '{filename}': {similarity_score:.4f}")
 
         except Exception as e:
-            print(e)
+            print(f"Error processing image '{filename}': {e}")
+            continue
 
-    del loss_fn
-    return total_lpips_distance / i
+    return similarity_scores
 
 
 @torch.no_grad()
@@ -158,10 +194,10 @@ def inference(model, x, recon_dir, name=None):
         out = out.permute(1, 2, 0)
         out = out.cpu().numpy()
 
-        # print(out.shape)
+        _, tail = os.path.split(name)
         I_ll = out.astype(np.uint8)
         im_nll = Image.fromarray(I_ll)
-        im_nll.save(recon_dir + '/' + name[-11:])
+        im_nll.save(recon_dir+'/'+tail)
 
     metrics = compute_metrics(x, out_dec["x_hat"], 255)
     num_pixels = x.size(0) * x.size(2) * x.size(3)

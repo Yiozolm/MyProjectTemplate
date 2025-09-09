@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.optim as optim
 import warnings
 from PIL import Image
-from torch.optim.optimizer import Args
 from models import models
 from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
@@ -84,8 +83,11 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out = model(x)
-        out_criterion = criterion(out, x)
+        with accelerator.autocast():
+            out = model(x)
+
+        with torch.autocast(device_type='cuda', enabled=False):
+            out_criterion = criterion(out, x)
 
         accelerator.backward(out_criterion["loss"])
 
@@ -93,10 +95,9 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
             accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
             
         optimizer.step()
-        
-        aux_loss = model.aux_loss()
+        with torch.autocast(device_type='cuda', enabled=False):
+            aux_loss = accelerator.unwrap_model(model).aux_loss()
 
-        # 使用 accelerator.backward
         accelerator.backward(aux_loss)
         aux_optimizer.step()
 
@@ -127,14 +128,16 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, accelerator, tb_writer=
 
     with torch.no_grad():
         for x in eval_dataloader:
-            out = model(x)
-            out_criterion = criterion(out, x)
+            with accelerator.autocast():
+                out = model(x)
+            with torch.autocast(device_type='cuda', enabled=False):
+                out_criterion = criterion(out, x)
             N = x.shape[0]
 
             loss += out_criterion["loss"] * N
             img_bpp += out_criterion["bpp_loss"] * N
             mse_loss += out_criterion["mse_loss"] * N
-            aux_loss_val += model.aux_loss() * N
+            aux_loss_val += accelerator.unwrap_model(model).aux_loss() * N
             eval_size += N
             
             if accelerator.is_main_process and save_imgs:
@@ -191,6 +194,12 @@ def parse_args(argv):
         help="Number of epochs (default: %(default)s)",
     )
     parser.add_argument(
+        "-td", "--train_dataset", type=str, required=True, help="Training dataset"
+    )
+    parser.add_argument(
+        "-ed", "--eval_dataset", type=str, required=True, help="Evaluation dataset"
+    )
+    parser.add_argument(
         "-lr",
         "--learning-rate",
         default=1e-4,
@@ -215,7 +224,7 @@ def parse_args(argv):
         "--model",
         type=str,
         default=0.0067,
-        choices=['factorized', 'hyperprior', 'mbt2018-mean', 'mbt2018', 'cheng2020-anchor', 'cheng2020-attn],
+        choices=['factorized', 'hyperprior', 'mbt2018-mean', 'mbt2018', 'cheng2020-anchor', 'cheng2020-attn'],
         help="Used Model (default: %(default)s)",
     )
     parser.add_argument(
@@ -301,7 +310,6 @@ class ImageDataset(data.Dataset):
 
 def main(argv):
     args = parse_args(argv)
-    print(args)
 
     mixed_precision = "no"
     if args.half and args.bf16:
@@ -313,6 +321,9 @@ def main(argv):
     
     accelerator = Accelerator(mixed_precision=mixed_precision)
     accelerator.print(f"Using {accelerator.num_processes} GPUs for training with {mixed_precision} precision.")
+
+    if accelerator.is_main_process:
+        print(args)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -330,8 +341,8 @@ def main(argv):
         [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
     )
 
-    train_dataset = ImageDataset("your/train/data", transform=train_transforms)
-    eval_dataset = ImageDataset("your/test/data", transform=eval_transforms)
+    train_dataset = ImageDataset(args.train_dataset, transform=train_transforms)
+    eval_dataset = ImageDataset(args.eval_dataset, transform=eval_transforms)
 
     train_dataloader = data.DataLoader(
         train_dataset,
@@ -349,7 +360,11 @@ def main(argv):
         pin_memory=True,
     )
 
-    net = models[args.model](N=args.N, M=args.M)
+    kwargs = dict()
+    kwargs['N'] = args.N
+    kwargs['M'] = args.M
+    net = models[args.model](**kwargs)
+
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[36], gamma=0.1)

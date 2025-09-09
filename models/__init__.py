@@ -1,20 +1,20 @@
-from compressai.zoo.image import (
-    bmshj2018_factorized,
-    bmshj2018_hyperprior,
-    cheng2020_anchor,
-    cheng2020_attn,
-    mbt2018,
-    mbt2018_mean,
+from compressai.models import (
+    FactorizedPrior,
+    ScaleHyperprior,
+    MeanScaleHyperprior,
+    JointAutoregressiveHierarchicalPriors,
+    Cheng2020Anchor,
+    Cheng2020Attention,
 )
 
 
 image_models = {
-    "factorized": bmshj2018_factorized,
-    "hyperprior": bmshj2018_hyperprior,
-    "mbt2018-mean": mbt2018_mean,
-    "mbt2018": mbt2018,
-    "cheng2020-anchor": cheng2020_anchor,
-    "cheng2020-attn": cheng2020_attn,
+    "factorized": FactorizedPrior,
+    "hyperprior": ScaleHyperprior,
+    "mbt2018-mean": MeanScaleHyperprior,
+    "mbt2018": JointAutoregressiveHierarchicalPriors,
+    "cheng2020-anchor": Cheng2020Anchor,
+    "cheng2020-attn": Cheng2020Attention,
 }
 
 

@@ -103,10 +103,10 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
 
         train_step += 1
         if accelerator.is_main_process and tb_writer and train_step % 10 == 1:
-            tb_writer.add_scalar('train loss', out_criterion["loss"].item(), train_step)
-            tb_writer.add_scalar('train mse', out_criterion["mse_loss"].item(), train_step)
-            tb_writer.add_scalar('train img bpp', out_criterion["bpp_loss"].item(), train_step)
-            tb_writer.add_scalar('train aux', aux_loss.item(), train_step)
+            tb_writer.add_scalar('train/loss', out_criterion["loss"].item(), train_step)
+            tb_writer.add_scalar('train/mse', out_criterion["mse_loss"].item(), train_step)
+            tb_writer.add_scalar('train/img bpp', out_criterion["bpp_loss"].item(), train_step)
+            tb_writer.add_scalar('train/aux', aux_loss.item(), train_step)
 
         train_size += x.shape[0]
 
@@ -224,7 +224,7 @@ def parse_args(argv):
         "--model",
         type=str,
         default=0.0067,
-        choices=['factorized', 'hyperprior', 'mbt2018-mean', 'mbt2018', 'cheng2020-anchor', 'cheng2020-attn'],
+        choices=list(models.keys()),
         help="Used Model (default: %(default)s)",
     )
     parser.add_argument(
@@ -343,6 +343,13 @@ def main(argv):
 
     train_dataset = ImageDataset(args.train_dataset, transform=train_transforms)
     eval_dataset = ImageDataset(args.eval_dataset, transform=eval_transforms)
+
+    args_dict = vars(args)
+    args_dict['Train_length'] = len(train_dataset)
+    args_dict['Eval_length'] = len(eval_dataset)
+    config_filepath = os.path.join(args.save_path, "run_parameters.json")
+    with open(config_filepath, 'w') as f:
+        json.dump(args_dict, f, indent=4)
 
     train_dataloader = data.DataLoader(
         train_dataset,

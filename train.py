@@ -164,7 +164,7 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, accelerator, tb_writer=
         final_img_bpp = (total_img_bpp / total_eval_size).item()
         final_mse_loss = (total_mse_loss / total_eval_size).item()
         final_aux_loss = (total_aux_loss_val / total_eval_size).item()
-        psnr = 10. * np.log10(1. ** 2 / final_mse_loss)
+        psnr = 10. * np.log10(255. ** 2 / final_mse_loss)
         
         if tb_writer:
             tb_writer.add_scalar('eval/eval loss', final_loss, epoch)

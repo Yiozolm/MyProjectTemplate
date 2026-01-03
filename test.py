@@ -12,7 +12,13 @@ from pytorch_msssim import ms_ssim
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.dists import DeepImageStructureAndTextureSimilarity
+from torchvision import transforms
+from torchvision.transforms.functional import resize, to_tensor
 from transformers import CLIPProcessor, CLIPModel
+
+
+# Alias for DISTS
+DISTS = DeepImageStructureAndTextureSimilarity
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -33,6 +39,9 @@ IMG_EXTENSIONS = (
     ".tiff",
     ".webp",
 )
+
+# Global device configuration
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def collect_images(rootpath: str) -> List[str]:
@@ -55,6 +64,25 @@ def read_image(filepath: str) -> torch.Tensor:
     return output
 
 
+def load_images(directory: str, transform=None) -> torch.Tensor:
+    """Load images from a directory and apply optional transforms."""
+    image_files = collect_images(directory)
+    images = []
+
+    for filepath in image_files:
+        img = Image.open(filepath).convert("RGB")
+        if transform is not None:
+            img = transform(img)
+        else:
+            img = to_tensor(img)
+        images.append(img)
+
+    if len(images) == 0:
+        raise ValueError(f"No images found in directory: {directory}")
+
+    return torch.stack(images), [os.path.basename(f) for f in image_files]
+
+
 def compute_metrics(
         org: torch.Tensor, rec: torch.Tensor, max_val: int = 255
 ) -> Dict[str, Any]:
@@ -68,14 +96,13 @@ def compute_metrics(
 
 
 def eval_dist(origin_path, gene_path):
-    device = torch.device('cuda')
-    D = DISTS(load_weights=True).to(device)
+    D = DeepImageStructureAndTextureSimilarity().to(DEVICE)
     files = os.listdir(origin_path)
     distSum = 0
     for f in files:
-        x = read_image(os.path.join(origin_path, f)).to(device)
+        x = read_image(os.path.join(origin_path, f)).to(DEVICE)
         x = x / 255.
-        y = read_image(os.path.join(gene_path, f)).to(device)
+        y = read_image(os.path.join(gene_path, f)).to(DEVICE)
         y = y / 255.
         x.unsqueeze_(0)
         y.unsqueeze_(0)
@@ -94,9 +121,9 @@ def eval_fid(origin_path, gene_path):
     fake_fid, _ = load_images(gene_path, transform_fid)
 
     # FID
-    fid = FrechetInceptionDistance(normalize=True).to(device)
-    fid.update(real_fid.to(device), real=True)
-    fid.update(fake_fid.to(device), real=False)
+    fid = FrechetInceptionDistance(normalize=True).to(DEVICE)
+    fid.update(real_fid.to(DEVICE), real=True)
+    fid.update(fake_fid.to(DEVICE), real=False)
     fid_score = fid.compute().item()
 
     return fid_score
@@ -110,8 +137,8 @@ def eval_lpips(origin_path, gene_path):
     real_metric, _ = load_images(origin_path, transform_metric)
     fake_metric, _ = load_images(gene_path, transform_metric)
 
-    lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
-    lpips_scores = lpips(real_metric.to(device), fake_metric.to(device)).item()
+    lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(DEVICE)
+    lpips_scores = lpips(real_metric.to(DEVICE), fake_metric.to(DEVICE)).item()
 
     return lpips_scores
 
@@ -261,10 +288,9 @@ def inference_entropy_estimation(model, x):
 
 
 def eval_model(model, filepaths, recon_dir, entropy_estimation=False, half=False):
-    device = next(model.parameters()).device
     metrics = defaultdict(float)
     for f in filepaths:
-        x = read_image(f).to(device)
+        x = read_image(f).to(DEVICE)
         if not entropy_estimation:
             if half:
                 model = model.to(torch.bfloat16)
@@ -277,3 +303,114 @@ def eval_model(model, filepaths, recon_dir, entropy_estimation=False, half=False
     for k, v in metrics.items():
         metrics[k] = v / len(filepaths)
     return metrics
+
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description='Image compression and quality metrics evaluation')
+    parser.add_argument('--mode', type=str, required=True,
+                        choices=['eval_model', 'eval_psnr_ms_ssim', 'eval_fid', 'eval_lpips', 'eval_dists', 'eval_clip'],
+                        help='Evaluation mode')
+    parser.add_argument('--origin_path', type=str, help='Path to original images')
+    parser.add_argument('--gene_path', type=str, help='Path to reconstructed/generated images')
+    parser.add_argument('--recon_dir', type=str, help='Directory to save reconstructed images')
+    parser.add_argument('--model_path', type=str, help='Path to model checkpoint')
+    parser.add_argument('--entropy_estimation', action='store_true',
+                        help='Use entropy estimation instead of actual compression')
+    parser.add_argument('--half', action='store_true',
+                        help='Use half precision (bfloat16)')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    print(f"Using device: {DEVICE}")
+
+    if args.mode == 'eval_model':
+        if args.model_path is None:
+            raise ValueError("--model_path is required for eval_model mode")
+        if args.recon_dir is None:
+            raise ValueError("--recon_dir is required for eval_model mode")
+
+        # Load model (example - adjust based on your model architecture)
+        # model = load_model(args.model_path)
+        # model = model.to(DEVICE)
+        # model.eval()
+
+        filepaths = collect_images(args.origin_path)
+        print(f"Evaluating {len(filepaths)} images...")
+
+        # metrics = eval_model(model, filepaths, args.recon_dir,
+        #                      entropy_estimation=args.entropy_estimation,
+        #                      half=args.half)
+        # print("Average metrics:")
+        # for k, v in metrics.items():
+        #     print(f"  {k}: {v:.4f}")
+        print("Please implement model loading logic based on your architecture")
+
+    elif args.mode == 'eval_psnr_ms_ssim':
+        if args.origin_path is None or args.gene_path is None:
+            raise ValueError("--origin_path and --gene_path are required for eval_psnr_ms_ssim mode")
+
+        filepaths = collect_images(args.origin_path)
+        print(f"Evaluating PSNR and MS-SSIM for {len(filepaths)} images...")
+
+        metrics = defaultdict(float)
+        for f in filepaths:
+            filename = os.path.basename(f)
+            org = read_image(f).to(DEVICE)
+            rec = read_image(os.path.join(args.gene_path, filename)).to(DEVICE)
+            m = compute_metrics(org, rec)
+            for k, v in m.items():
+                metrics[k] += v
+
+        for k, v in metrics.items():
+            metrics[k] = v / len(filepaths)
+
+        print("Average metrics:")
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
+
+    elif args.mode == 'eval_fid':
+        if args.origin_path is None or args.gene_path is None:
+            raise ValueError("--origin_path and --gene_path are required for eval_fid mode")
+
+        print("Computing FID score...")
+        fid_score = eval_fid(args.origin_path, args.gene_path)
+        print(f"FID: {fid_score:.4f}")
+
+    elif args.mode == 'eval_lpips':
+        if args.origin_path is None or args.gene_path is None:
+            raise ValueError("--origin_path and --gene_path are required for eval_lpips mode")
+
+        print("Computing LPIPS score...")
+        lpips_score = eval_lpips(args.origin_path, args.gene_path)
+        print(f"LPIPS: {lpips_score:.4f}")
+
+    elif args.mode == 'eval_dists':
+        if args.origin_path is None or args.gene_path is None:
+            raise ValueError("--origin_path and --gene_path are required for eval_dists mode")
+
+        print("Computing DISTS score...")
+        dists_score = eval_dist(args.origin_path, args.gene_path)
+        print(f"DISTS: {dists_score:.4f}")
+
+    elif args.mode == 'eval_clip':
+        if args.origin_path is None or args.gene_path is None:
+            raise ValueError("--origin_path and --gene_path are required for eval_clip mode")
+
+        print("Computing CLIP similarity...")
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        similarities = calculate_clip_similarity_batch(
+            args.origin_path, args.gene_path, model, processor, DEVICE
+        )
+
+        avg_similarity = sum(similarities.values()) / len(similarities)
+        print(f"Average CLIP similarity: {avg_similarity:.4f}")
+
+
+if __name__ == "__main__":
+    main()
